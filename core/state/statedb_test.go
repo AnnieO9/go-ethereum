@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -56,7 +57,7 @@ func TestUpdateLeaks(t *testing.T) {
 	// Update it with some accounts
 	for i := byte(0); i < 255; i++ {
 		addr := common.BytesToAddress([]byte{i})
-		state.AddBalance(addr, uint256.NewInt(uint64(11*i)))
+		state.AddBalance(addr, uint256.NewInt(uint64(11*i)), tracing.BalanceChangeUnspecified)
 		state.SetNonce(addr, uint64(42*i))
 		if i%2 == 0 {
 			state.SetState(addr, common.BytesToHash([]byte{i, i, i}), common.BytesToHash([]byte{i, i, i, i}))
@@ -91,7 +92,7 @@ func TestIntermediateLeaks(t *testing.T) {
 	finalState, _ := New(types.EmptyRootHash, NewDatabaseWithNodeDB(finalDb, finalNdb), nil)
 
 	modify := func(state *StateDB, addr common.Address, i, tweak byte) {
-		state.SetBalance(addr, uint256.NewInt(uint64(11*i)+uint64(tweak)))
+		state.SetBalance(addr, uint256.NewInt(uint64(11*i)+uint64(tweak)), tracing.BalanceChangeUnspecified)
 		state.SetNonce(addr, uint64(42*i+tweak))
 		if i%2 == 0 {
 			state.SetState(addr, common.Hash{i, i, i, 0}, common.Hash{})
@@ -167,7 +168,7 @@ func TestCopy(t *testing.T) {
 
 	for i := byte(0); i < 255; i++ {
 		obj := orig.getOrNewStateObject(common.BytesToAddress([]byte{i}))
-		obj.AddBalance(uint256.NewInt(uint64(i)))
+		obj.AddBalance(uint256.NewInt(uint64(i)), tracing.BalanceChangeUnspecified)
 		orig.updateStateObject(obj)
 	}
 	orig.Finalise(false)
@@ -184,9 +185,9 @@ func TestCopy(t *testing.T) {
 		copyObj := copy.getOrNewStateObject(common.BytesToAddress([]byte{i}))
 		ccopyObj := ccopy.getOrNewStateObject(common.BytesToAddress([]byte{i}))
 
-		origObj.AddBalance(uint256.NewInt(2 * uint64(i)))
-		copyObj.AddBalance(uint256.NewInt(3 * uint64(i)))
-		ccopyObj.AddBalance(uint256.NewInt(4 * uint64(i)))
+		origObj.AddBalance(uint256.NewInt(2*uint64(i)), tracing.BalanceChangeUnspecified)
+		copyObj.AddBalance(uint256.NewInt(3*uint64(i)), tracing.BalanceChangeUnspecified)
+		ccopyObj.AddBalance(uint256.NewInt(4*uint64(i)), tracing.BalanceChangeUnspecified)
 
 		orig.updateStateObject(origObj)
 		copy.updateStateObject(copyObj)
@@ -220,6 +221,78 @@ func TestCopy(t *testing.T) {
 		}
 		if want := uint256.NewInt(5 * uint64(i)); ccopyObj.Balance().Cmp(want) != 0 {
 			t.Errorf("copy obj %d: balance mismatch: have %v, want %v", i, ccopyObj.Balance(), want)
+		}
+	}
+}
+
+// TestCopyWithDirtyJournal tests if Copy can correct create a equal copied
+// stateDB with dirty journal present.
+func TestCopyWithDirtyJournal(t *testing.T) {
+	db := NewDatabase(rawdb.NewMemoryDatabase())
+	orig, _ := New(types.EmptyRootHash, db, nil)
+
+	// Fill up the initial states
+	for i := byte(0); i < 255; i++ {
+		obj := orig.getOrNewStateObject(common.BytesToAddress([]byte{i}))
+		obj.AddBalance(uint256.NewInt(uint64(i)), tracing.BalanceChangeUnspecified)
+		obj.data.Root = common.HexToHash("0xdeadbeef")
+		orig.updateStateObject(obj)
+	}
+	root, _ := orig.Commit(0, true)
+	orig, _ = New(root, db, nil)
+
+	// modify all in memory without finalizing
+	for i := byte(0); i < 255; i++ {
+		obj := orig.getOrNewStateObject(common.BytesToAddress([]byte{i}))
+		obj.SubBalance(uint256.NewInt(uint64(i)), tracing.BalanceChangeUnspecified)
+		orig.updateStateObject(obj)
+	}
+	cpy := orig.Copy()
+
+	orig.Finalise(true)
+	for i := byte(0); i < 255; i++ {
+		root := orig.GetStorageRoot(common.BytesToAddress([]byte{i}))
+		if root != (common.Hash{}) {
+			t.Errorf("Unexpected storage root %x", root)
+		}
+	}
+	cpy.Finalise(true)
+	for i := byte(0); i < 255; i++ {
+		root := cpy.GetStorageRoot(common.BytesToAddress([]byte{i}))
+		if root != (common.Hash{}) {
+			t.Errorf("Unexpected storage root %x", root)
+		}
+	}
+	if cpy.IntermediateRoot(true) != orig.IntermediateRoot(true) {
+		t.Error("State is not equal after copy")
+	}
+}
+
+// TestCopyObjectState creates an original state, S1, and makes a copy S2.
+// It then proceeds to make changes to S1. Those changes are _not_ supposed
+// to affect S2. This test checks that the copy properly deep-copies the objectstate
+func TestCopyObjectState(t *testing.T) {
+	db := NewDatabase(rawdb.NewMemoryDatabase())
+	orig, _ := New(types.EmptyRootHash, db, nil)
+
+	// Fill up the initial states
+	for i := byte(0); i < 5; i++ {
+		obj := orig.getOrNewStateObject(common.BytesToAddress([]byte{i}))
+		obj.AddBalance(uint256.NewInt(uint64(i)), tracing.BalanceChangeUnspecified)
+		obj.data.Root = common.HexToHash("0xdeadbeef")
+		orig.updateStateObject(obj)
+	}
+	orig.Finalise(true)
+	cpy := orig.Copy()
+	for _, op := range cpy.mutations {
+		if have, want := op.applied, false; have != want {
+			t.Fatalf("Error in test itself, the 'done' flag should not be set before Commit, have %v want %v", have, want)
+		}
+	}
+	orig.Commit(0, true)
+	for _, op := range cpy.mutations {
+		if have, want := op.applied, false; have != want {
+			t.Fatalf("Error: original state affected copy, have %v want %v", have, want)
 		}
 	}
 }
@@ -266,14 +339,14 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 		{
 			name: "SetBalance",
 			fn: func(a testAction, s *StateDB) {
-				s.SetBalance(addr, uint256.NewInt(uint64(a.args[0])))
+				s.SetBalance(addr, uint256.NewInt(uint64(a.args[0])), tracing.BalanceChangeUnspecified)
 			},
 			args: make([]int64, 1),
 		},
 		{
 			name: "AddBalance",
 			fn: func(a testAction, s *StateDB) {
-				s.AddBalance(addr, uint256.NewInt(uint64(a.args[0])))
+				s.AddBalance(addr, uint256.NewInt(uint64(a.args[0])), tracing.BalanceChangeUnspecified)
 			},
 			args: make([]int64, 1),
 		},
@@ -307,7 +380,30 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 		{
 			name: "CreateAccount",
 			fn: func(a testAction, s *StateDB) {
-				s.CreateAccount(addr)
+				if !s.Exist(addr) {
+					s.CreateAccount(addr)
+				}
+			},
+		},
+		{
+			name: "CreateContract",
+			fn: func(a testAction, s *StateDB) {
+				if !s.Exist(addr) {
+					s.CreateAccount(addr)
+				}
+				contractHash := s.GetCodeHash(addr)
+				emptyCode := contractHash == (common.Hash{}) || contractHash == types.EmptyCodeHash
+				storageRoot := s.GetStorageRoot(addr)
+				emptyStorage := storageRoot == (common.Hash{}) || storageRoot == types.EmptyRootHash
+				if s.GetNonce(addr) == 0 && emptyCode && emptyStorage {
+					s.CreateContract(addr)
+					// We also set some code here, to prevent the
+					// CreateContract action from being performed twice in a row,
+					// which would cause a difference in state when unrolling
+					// the journal. (CreateContact assumes created was false prior to
+					// invocation, and the journal rollback sets it to false).
+					s.SetCode(addr, []byte{1})
+				}
 			},
 		},
 		{
@@ -536,7 +632,7 @@ func TestTouchDelete(t *testing.T) {
 	s.state, _ = New(root, s.state.db, s.state.snaps)
 
 	snapshot := s.state.Snapshot()
-	s.state.AddBalance(common.Address{}, new(uint256.Int))
+	s.state.AddBalance(common.Address{}, new(uint256.Int), tracing.BalanceChangeUnspecified)
 
 	if len(s.state.journal.dirties) != 1 {
 		t.Fatal("expected one dirty state object")
@@ -552,7 +648,7 @@ func TestTouchDelete(t *testing.T) {
 func TestCopyOfCopy(t *testing.T) {
 	state, _ := New(types.EmptyRootHash, NewDatabase(rawdb.NewMemoryDatabase()), nil)
 	addr := common.HexToAddress("aaaa")
-	state.SetBalance(addr, uint256.NewInt(42))
+	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified)
 
 	if got := state.Copy().GetBalance(addr).Uint64(); got != 42 {
 		t.Fatalf("1st copy fail, expected 42, got %v", got)
@@ -575,9 +671,9 @@ func TestCopyCommitCopy(t *testing.T) {
 	skey := common.HexToHash("aaa")
 	sval := common.HexToHash("bbb")
 
-	state.SetBalance(addr, uint256.NewInt(42)) // Change the account trie
-	state.SetCode(addr, []byte("hello"))       // Change an external metadata
-	state.SetState(addr, skey, sval)           // Change the storage trie
+	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
+	state.SetCode(addr, []byte("hello"))                                         // Change an external metadata
+	state.SetState(addr, skey, sval)                                             // Change the storage trie
 
 	if balance := state.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
 		t.Fatalf("initial balance mismatch: have %v, want %v", balance, 42)
@@ -648,9 +744,9 @@ func TestCopyCopyCommitCopy(t *testing.T) {
 	skey := common.HexToHash("aaa")
 	sval := common.HexToHash("bbb")
 
-	state.SetBalance(addr, uint256.NewInt(42)) // Change the account trie
-	state.SetCode(addr, []byte("hello"))       // Change an external metadata
-	state.SetState(addr, skey, sval)           // Change the storage trie
+	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
+	state.SetCode(addr, []byte("hello"))                                         // Change an external metadata
+	state.SetState(addr, skey, sval)                                             // Change the storage trie
 
 	if balance := state.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
 		t.Fatalf("initial balance mismatch: have %v, want %v", balance, 42)
@@ -708,18 +804,19 @@ func TestCopyCopyCommitCopy(t *testing.T) {
 	}
 }
 
-// TestCommitCopy tests the copy from a committed state is not functional.
+// TestCommitCopy tests the copy from a committed state is not fully functional.
 func TestCommitCopy(t *testing.T) {
-	state, _ := New(types.EmptyRootHash, NewDatabase(rawdb.NewMemoryDatabase()), nil)
+	db := NewDatabase(rawdb.NewMemoryDatabase())
+	state, _ := New(types.EmptyRootHash, db, nil)
 
 	// Create an account and check if the retrieved balance is correct
 	addr := common.HexToAddress("0xaffeaffeaffeaffeaffeaffeaffeaffeaffeaffe")
-	skey := common.HexToHash("aaa")
-	sval := common.HexToHash("bbb")
+	skey1, skey2 := common.HexToHash("a1"), common.HexToHash("a2")
+	sval1, sval2 := common.HexToHash("b1"), common.HexToHash("b2")
 
-	state.SetBalance(addr, uint256.NewInt(42)) // Change the account trie
-	state.SetCode(addr, []byte("hello"))       // Change an external metadata
-	state.SetState(addr, skey, sval)           // Change the storage trie
+	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
+	state.SetCode(addr, []byte("hello"))                                         // Change an external metadata
+	state.SetState(addr, skey1, sval1)                                           // Change the storage trie
 
 	if balance := state.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
 		t.Fatalf("initial balance mismatch: have %v, want %v", balance, 42)
@@ -727,25 +824,38 @@ func TestCommitCopy(t *testing.T) {
 	if code := state.GetCode(addr); !bytes.Equal(code, []byte("hello")) {
 		t.Fatalf("initial code mismatch: have %x, want %x", code, []byte("hello"))
 	}
-	if val := state.GetState(addr, skey); val != sval {
-		t.Fatalf("initial non-committed storage slot mismatch: have %x, want %x", val, sval)
+	if val := state.GetState(addr, skey1); val != sval1 {
+		t.Fatalf("initial non-committed storage slot mismatch: have %x, want %x", val, sval1)
 	}
-	if val := state.GetCommittedState(addr, skey); val != (common.Hash{}) {
+	if val := state.GetCommittedState(addr, skey1); val != (common.Hash{}) {
 		t.Fatalf("initial committed storage slot mismatch: have %x, want %x", val, common.Hash{})
 	}
-	// Copy the committed state database, the copied one is not functional.
-	state.Commit(0, true)
+	root, _ := state.Commit(0, true)
+
+	state, _ = New(root, db, nil)
+	state.SetState(addr, skey2, sval2)
+	state.Commit(1, true)
+
+	// Copy the committed state database, the copied one is not fully functional.
 	copied := state.Copy()
-	if balance := copied.GetBalance(addr); balance.Cmp(uint256.NewInt(0)) != 0 {
+	if balance := copied.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
 		t.Fatalf("unexpected balance: have %v", balance)
 	}
-	if code := copied.GetCode(addr); code != nil {
+	if code := copied.GetCode(addr); !bytes.Equal(code, []byte("hello")) {
 		t.Fatalf("unexpected code: have %x", code)
 	}
-	if val := copied.GetState(addr, skey); val != (common.Hash{}) {
+	// Miss slots because of non-functional trie after commit
+	if val := copied.GetState(addr, skey1); val != (common.Hash{}) {
+		t.Fatalf("unexpected storage slot: have %x", sval1)
+	}
+	if val := copied.GetCommittedState(addr, skey1); val != (common.Hash{}) {
 		t.Fatalf("unexpected storage slot: have %x", val)
 	}
-	if val := copied.GetCommittedState(addr, skey); val != (common.Hash{}) {
+	// Slots cached in the stateDB, available after commit
+	if val := copied.GetState(addr, skey2); val != sval2 {
+		t.Fatalf("unexpected storage slot: have %x", sval1)
+	}
+	if val := copied.GetCommittedState(addr, skey2); val != sval2 {
 		t.Fatalf("unexpected storage slot: have %x", val)
 	}
 	if !errors.Is(copied.Error(), trie.ErrCommitted) {
@@ -766,7 +876,7 @@ func TestDeleteCreateRevert(t *testing.T) {
 	state, _ := New(types.EmptyRootHash, NewDatabase(rawdb.NewMemoryDatabase()), nil)
 
 	addr := common.BytesToAddress([]byte("so"))
-	state.SetBalance(addr, uint256.NewInt(1))
+	state.SetBalance(addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
 
 	root, _ := state.Commit(0, false)
 	state, _ = New(root, state.db, state.snaps)
@@ -776,7 +886,7 @@ func TestDeleteCreateRevert(t *testing.T) {
 	state.Finalise(true)
 
 	id := state.Snapshot()
-	state.SetBalance(addr, uint256.NewInt(2))
+	state.SetBalance(addr, uint256.NewInt(2), tracing.BalanceChangeUnspecified)
 	state.RevertToSnapshot(id)
 
 	// Commit the entire state and make sure we don't crash and have the correct state
@@ -818,10 +928,10 @@ func testMissingTrieNodes(t *testing.T, scheme string) {
 	state, _ := New(types.EmptyRootHash, db, nil)
 	addr := common.BytesToAddress([]byte("so"))
 	{
-		state.SetBalance(addr, uint256.NewInt(1))
+		state.SetBalance(addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
 		state.SetCode(addr, []byte{1, 2, 3})
 		a2 := common.BytesToAddress([]byte("another"))
-		state.SetBalance(a2, uint256.NewInt(100))
+		state.SetBalance(a2, uint256.NewInt(100), tracing.BalanceChangeUnspecified)
 		state.SetCode(a2, []byte{1, 2, 4})
 		root, _ = state.Commit(0, false)
 		t.Logf("root: %x", root)
@@ -846,7 +956,7 @@ func testMissingTrieNodes(t *testing.T, scheme string) {
 		t.Errorf("expected %d, got %d", exp, got)
 	}
 	// Modify the state
-	state.SetBalance(addr, uint256.NewInt(2))
+	state.SetBalance(addr, uint256.NewInt(2), tracing.BalanceChangeUnspecified)
 	root, err := state.Commit(0, false)
 	if err == nil {
 		t.Fatalf("expected error, got root :%x", root)
@@ -1102,40 +1212,6 @@ func TestStateDBTransientStorage(t *testing.T) {
 	}
 }
 
-func TestResetObject(t *testing.T) {
-	var (
-		disk     = rawdb.NewMemoryDatabase()
-		tdb      = triedb.NewDatabase(disk, nil)
-		db       = NewDatabaseWithNodeDB(disk, tdb)
-		snaps, _ = snapshot.New(snapshot.Config{CacheSize: 10}, disk, tdb, types.EmptyRootHash)
-		state, _ = New(types.EmptyRootHash, db, snaps)
-		addr     = common.HexToAddress("0x1")
-		slotA    = common.HexToHash("0x1")
-		slotB    = common.HexToHash("0x2")
-	)
-	// Initialize account with balance and storage in first transaction.
-	state.SetBalance(addr, uint256.NewInt(1))
-	state.SetState(addr, slotA, common.BytesToHash([]byte{0x1}))
-	state.IntermediateRoot(true)
-
-	// Reset account and mutate balance and storages
-	state.CreateAccount(addr)
-	state.SetBalance(addr, uint256.NewInt(2))
-	state.SetState(addr, slotB, common.BytesToHash([]byte{0x2}))
-	root, _ := state.Commit(0, true)
-
-	// Ensure the original account is wiped properly
-	snap := snaps.Snapshot(root)
-	slot, _ := snap.Storage(crypto.Keccak256Hash(addr.Bytes()), crypto.Keccak256Hash(slotA.Bytes()))
-	if len(slot) != 0 {
-		t.Fatalf("Unexpected storage slot")
-	}
-	slot, _ = snap.Storage(crypto.Keccak256Hash(addr.Bytes()), crypto.Keccak256Hash(slotB.Bytes()))
-	if !bytes.Equal(slot, []byte{0x2}) {
-		t.Fatalf("Unexpected storage slot value %v", slot)
-	}
-}
-
 func TestDeleteStorage(t *testing.T) {
 	var (
 		disk     = rawdb.NewMemoryDatabase()
@@ -1146,7 +1222,7 @@ func TestDeleteStorage(t *testing.T) {
 		addr     = common.HexToAddress("0x1")
 	)
 	// Initialize account and populate storage
-	state.SetBalance(addr, uint256.NewInt(1))
+	state.SetBalance(addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
 	state.CreateAccount(addr)
 	for i := 0; i < 1000; i++ {
 		slot := common.Hash(uint256.NewInt(uint64(i)).Bytes32())
@@ -1161,12 +1237,12 @@ func TestDeleteStorage(t *testing.T) {
 	obj := fastState.getOrNewStateObject(addr)
 	storageRoot := obj.data.Root
 
-	_, _, fastNodes, err := fastState.deleteStorage(addr, crypto.Keccak256Hash(addr[:]), storageRoot)
+	_, fastNodes, err := fastState.deleteStorage(addr, crypto.Keccak256Hash(addr[:]), storageRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, slowNodes, err := slowState.deleteStorage(addr, crypto.Keccak256Hash(addr[:]), storageRoot)
+	_, slowNodes, err := slowState.deleteStorage(addr, crypto.Keccak256Hash(addr[:]), storageRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1177,7 +1253,7 @@ func TestDeleteStorage(t *testing.T) {
 				t.Fatal("delete should have empty hashes")
 			}
 			if len(n.Blob) != 0 {
-				t.Fatal("delete should have have empty blobs")
+				t.Fatal("delete should have empty blobs")
 			}
 			a = append(a, fmt.Sprintf("%x", path))
 		})
